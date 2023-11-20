@@ -51,6 +51,8 @@ import (
 )
 
 const (
+	annotationRemoveLock = "tf.upbound.io/force-unlock-id"
+
 	errNotWorkspace = "managed resource is not a Workspace custom resource"
 	errTrackPCUsage = "cannot track ProviderConfig usage"
 	errGetPC        = "cannot get ProviderConfig"
@@ -75,6 +77,7 @@ const (
 	errVarMap          = "cannot get tfvars from var map"
 	errDeleteWorkspace = "cannot delete Terraform workspace"
 	errChecksum        = "cannot calculate workspace checksum"
+	errForceUnlock     = "cannot force unlock"
 
 	gitCredentialsFilename = ".git-credentials"
 )
@@ -105,6 +108,7 @@ type tfclient interface {
 	Destroy(ctx context.Context, o ...terraform.Option) error
 	DeleteCurrentWorkspace(ctx context.Context) error
 	GenerateChecksum(ctx context.Context) (string, error)
+	ForceUnlock(ctx context.Context, lockID string) error
 }
 
 // Setup adds a controller that reconciles Workspace managed resources.
@@ -370,6 +374,17 @@ func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.Ext
 	cr, ok := mg.(*v1beta1.Workspace)
 	if !ok {
 		return managed.ExternalUpdate{}, errors.New(errNotWorkspace)
+	}
+
+	l := c.logger.WithValues("request", cr.Name)
+
+	if lockID, ok := cr.Annotations[annotationRemoveLock]; ok {
+		delete(cr.Annotations, annotationRemoveLock)
+		err := c.tf.ForceUnlock(ctx, lockID)
+		if err != nil {
+			l.Info("failed to force unlock, removing annotation", "lockID", lockID, "err", err.Error())
+			return managed.ExternalUpdate{}, errors.Wrap(err, errForceUnlock)
+		}
 	}
 
 	o, err := c.options(ctx, cr.Spec.ForProvider)

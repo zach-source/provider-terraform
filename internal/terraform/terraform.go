@@ -555,3 +555,15 @@ func (h Harness) Destroy(ctx context.Context, o ...Option) error {
 	_, err := cmd.Output()
 	return Classify(err)
 }
+
+// Destroy a Terraform configuration.
+func (h Harness) ForceUnlock(ctx context.Context, lockID string) error {
+	args := []string{"force-unlock", "-no-color", "-force", lockID}
+	cmd := exec.CommandContext(ctx, h.Path, args...) //nolint:gosec
+	cmd.Dir = h.Dir
+
+	rwmutex.RLock()
+	defer rwmutex.RUnlock()
+	_, err := cmd.Output()
+	return Classify(err)
+}
