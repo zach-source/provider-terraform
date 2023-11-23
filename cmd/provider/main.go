@@ -20,6 +20,8 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"time"
 
 	"github.com/crossplane/crossplane-runtime/pkg/controller"
@@ -47,6 +49,7 @@ import (
 )
 
 func main() {
+
 	var (
 		app                        = kingpin.New(filepath.Base(os.Args[0]), "Terraform support for Crossplane.").DefaultEnvars()
 		debug                      = app.Flag("debug", "Run with debug logging.").Short('d').Bool()
@@ -58,8 +61,22 @@ func main() {
 		maxReconcileRate           = app.Flag("max-reconcile-rate", "The maximum number of concurrent reconciliation operations.").Default("1").Int()
 		namespace                  = app.Flag("namespace", "Namespace used to set as default scope in default secret store config.").Default("crossplane-system").Envar("POD_NAMESPACE").String()
 		enableExternalSecretStores = app.Flag("enable-external-secret-stores", "Enable support for ExternalSecretStores.").Default("false").Envar("ENABLE_EXTERNAL_SECRET_STORES").Bool()
+		shardCount                 = app.Flag("shard-total", "Total number of shards.").Default("1").Envar("SHARD_COUNT").Uint64()
+		shardNodeID                = app.Flag("shard-node-id", "The node ID, if a statefulset this is automatically from hostname").Uint64()
 	)
 	kingpin.MustParse(app.Parse(os.Args[1:]))
+
+	if shardNodeID == nil {
+		nodeIdRegex := regexp.MustCompile(`-(\d+)`)
+		matches := nodeIdRegex.FindStringSubmatch(os.Getenv("HOSTNAME"))
+		if len(matches) == 2 {
+			parsedID, err := strconv.ParseUint(matches[1], 10, 64)
+			if err != nil {
+				kingpin.FatalIfError(err, "Cannot parse node id from hostname")
+			}
+			shardNodeID = &parsedID
+		}
+	}
 
 	zl := zap.New(zap.UseDevMode(*debug), UseISO8601())
 	log := logging.NewLogrLogger(zl.WithName("provider-terraform"))
@@ -128,7 +145,7 @@ func main() {
 		})), "cannot create default store config")
 	}
 
-	kingpin.FatalIfError(workspace.Setup(mgr, o, *timeout, *pollJitter), "Cannot setup Workspace controllers")
+	kingpin.FatalIfError(workspace.Setup(mgr, o, *timeout, *pollJitter, *shardNodeID, *shardCount), "Cannot setup Workspace controllers")
 	kingpin.FatalIfError(mgr.Start(ctrl.SetupSignalHandler()), "Cannot start controller manager")
 }
 

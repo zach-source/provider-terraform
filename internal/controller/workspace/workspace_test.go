@@ -77,6 +77,7 @@ type MockTf struct {
 	MockDestroy                func(ctx context.Context, o ...terraform.Option) error
 	MockDeleteCurrentWorkspace func(ctx context.Context) error
 	MockGenerateChecksum       func(ctx context.Context) (string, error)
+	MockForceUnlock            func(ctx context.Context, unlockID string) error
 }
 
 func (tf *MockTf) Init(ctx context.Context, cache bool, o ...terraform.InitOption) error {
@@ -113,6 +114,10 @@ func (tf *MockTf) Destroy(ctx context.Context, o ...terraform.Option) error {
 
 func (tf *MockTf) DeleteCurrentWorkspace(ctx context.Context) error {
 	return tf.MockDeleteCurrentWorkspace(ctx)
+}
+
+func (tf *MockTf) ForceUnlock(ctx context.Context, unlockID string) error {
+	return tf.MockForceUnlock(ctx, unlockID)
 }
 
 func TestConnect(t *testing.T) {

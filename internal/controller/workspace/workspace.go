@@ -31,7 +31,9 @@ import (
 	extensionsV1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	xpv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
 	"github.com/crossplane/crossplane-runtime/pkg/connection"
@@ -41,9 +43,11 @@ import (
 	"github.com/crossplane/crossplane-runtime/pkg/ratelimiter"
 	"github.com/crossplane/crossplane-runtime/pkg/reconciler/managed"
 	"github.com/crossplane/crossplane-runtime/pkg/resource"
+	kevent "sigs.k8s.io/controller-runtime/pkg/event"
 
 	"github.com/hashicorp/go-getter"
 
+	"github.com/cespare/xxhash/v2"
 	"github.com/upbound/provider-terraform/apis/v1beta1"
 	"github.com/upbound/provider-terraform/internal/controller/features"
 	"github.com/upbound/provider-terraform/internal/terraform"
@@ -112,7 +116,7 @@ type tfclient interface {
 }
 
 // Setup adds a controller that reconciles Workspace managed resources.
-func Setup(mgr ctrl.Manager, o controller.Options, timeout, pollJitter time.Duration) error {
+func Setup(mgr ctrl.Manager, o controller.Options, timeout, pollJitter time.Duration, nodeId, shardCount uint64) error {
 	name := managed.ControllerName(v1beta1.WorkspaceGroupKind)
 
 	fs := afero.Afero{Fs: afero.NewOsFs()}
@@ -144,11 +148,34 @@ func Setup(mgr ctrl.Manager, o controller.Options, timeout, pollJitter time.Dura
 		managed.WithTimeout(timeout),
 		managed.WithConnectionPublishers(cps...))
 
+	shardFunc := func(nodeId, total uint64) func(object client.Object) bool {
+		return func(object client.Object) bool {
+			uid := object.GetUID()
+			id := xxhash.Sum64([]byte(uid))
+			return id%total == nodeId
+		}
+	}
+
+	shardPred := predicate.Funcs{
+		CreateFunc: func(ev kevent.CreateEvent) bool {
+			return shardFunc(nodeId, shardCount)(ev.Object)
+		},
+		DeleteFunc: func(ev kevent.DeleteEvent) bool {
+			return shardFunc(nodeId, shardCount)(ev.Object)
+		},
+		UpdateFunc: func(ev kevent.UpdateEvent) bool {
+			return shardFunc(nodeId, shardCount)(ev.ObjectNew)
+		},
+		GenericFunc: func(ev kevent.GenericEvent) bool {
+			return shardFunc(nodeId, shardCount)(ev.Object)
+		},
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		Named(name).
 		WithOptions(o.ForControllerRuntime()).
-		WithEventFilter(resource.DesiredStateChanged()).
-		For(&v1beta1.Workspace{}).
+		WithEventFilter(predicate.And(resource.DesiredStateChanged(), shardPred)).
+		For(&v1beta1.Workspace{}, builder.WithPredicates(shardPred)).
 		Complete(ratelimiter.NewReconciler(name, r, o.GlobalRateLimiter))
 }
 
