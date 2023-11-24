@@ -30,8 +30,10 @@ import (
 // Setup creates all terraform controllers with the supplied options and adds
 // them to the supplied manager.
 func Setup(mgr ctrl.Manager, o controller.Options, timeout, pollJitter time.Duration, nodeId, shardCount uint64) error {
-	if err := config.Setup(mgr, o, timeout); err != nil {
-		return err
+	if nodeId == 0 {
+		if err := config.Setup(mgr, o, timeout); err != nil {
+			return err
+		}
 	}
 	if err := workspace.Setup(mgr, o, timeout, pollJitter, nodeId, shardCount); err != nil {
 		return err

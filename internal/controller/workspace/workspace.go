@@ -56,6 +56,7 @@ import (
 
 const (
 	annotationRemoveLock = "tf.upbound.io/force-unlock-id"
+	annotationHasLock    = "tf.upbound.io/lock-id"
 
 	errNotWorkspace = "managed resource is not a Workspace custom resource"
 	errTrackPCUsage = "cannot track ProviderConfig usage"
@@ -150,6 +151,10 @@ func Setup(mgr ctrl.Manager, o controller.Options, timeout, pollJitter time.Dura
 
 	shardFunc := func(nodeId, total uint64) func(object client.Object) bool {
 		return func(object client.Object) bool {
+			if total == 1 {
+				return true
+			}
+
 			uid := object.GetUID()
 			id := xxhash.Sum64([]byte(uid))
 			return id%total == nodeId
@@ -314,7 +319,7 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 	if err := tf.Init(ctx, *pc.Spec.PluginCache, o...); err != nil {
 		return nil, errors.Wrap(err, errInit)
 	}
-	return &external{tf: tf, kube: c.kube}, errors.Wrap(tf.Workspace(ctx, meta.GetExternalName(cr)), errWorkspace)
+	return &external{tf: tf, kube: c.kube, logger: c.logger}, errors.Wrap(tf.Workspace(ctx, meta.GetExternalName(cr)), errWorkspace)
 }
 
 type external struct {
@@ -405,11 +410,16 @@ func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.Ext
 
 	l := c.logger.WithValues("request", cr.Name)
 
+	if cr.Annotations == nil {
+		cr.Annotations = map[string]string{}
+	}
+
 	if lockID, ok := cr.Annotations[annotationRemoveLock]; ok {
 		delete(cr.Annotations, annotationRemoveLock)
+		delete(cr.Annotations, annotationHasLock)
 		err := c.tf.ForceUnlock(ctx, lockID)
 		if err != nil {
-			l.Info("failed to force unlock, removing annotation", "lockID", lockID, "err", err.Error())
+			l.Info("failed to force unlock", "lockID", lockID, "err", err.Error())
 			return managed.ExternalUpdate{}, errors.Wrap(err, errForceUnlock)
 		}
 	}
@@ -421,6 +431,12 @@ func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.Ext
 
 	o = append(o, terraform.WithArgs(cr.Spec.ForProvider.ApplyArgs))
 	if err := c.tf.Apply(ctx, o...); err != nil {
+		lockError := &terraform.LockError{}
+		if !errors.As(err, lockError) {
+			return managed.ExternalUpdate{}, errors.Wrap(err, errApply)
+		}
+
+		cr.Annotations[annotationHasLock] = lockError.ID()
 		return managed.ExternalUpdate{}, errors.Wrap(err, errApply)
 	}
 

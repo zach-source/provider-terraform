@@ -33,6 +33,7 @@ import (
 	"gopkg.in/alecthomas/kingpin.v2"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -98,7 +99,9 @@ func main() {
 
 	mgr, err := ctrl.NewManager(ratelimiter.LimitRESTConfig(cfg, *maxReconcileRate), ctrl.Options{
 		Cache: cache.Options{
-			SyncPeriod: syncInterval,
+			SyncPeriod:           syncInterval,
+			DefaultFieldSelector: fields.OneTermEqualSelector("", ""),
+			// write a selector to select the UID by a hash, use a transform func to do the hash math
 		},
 
 		// controller-runtime uses both ConfigMaps and Leases for leader

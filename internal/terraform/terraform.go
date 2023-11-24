@@ -51,7 +51,22 @@ const varFilePrefix = "crossplane-provider-terraform-"
 
 // Terraform often returns a summary of the error it encountered on a single
 // line, prefixed with 'Error: '.
+var tfLockError = regexp.MustCompile(`Error acquiring the state lock`)
 var tfError = regexp.MustCompile(`Error: (.+)\n`)
+var tfLockID = regexp.MustCompile(`\s+ID: (.+)\n`)
+
+type LockError struct {
+	lockID  string
+	message string
+}
+
+func (e *LockError) ID() string {
+	return e.lockID
+}
+
+func (e *LockError) Error() string {
+	return e.message
+}
 
 // Classify errors returned from the Terraform CLI by inspecting its stderr.
 func Classify(err error) error {
@@ -60,14 +75,31 @@ func Classify(err error) error {
 		return err
 	}
 
-	summary, base64FullErr, err := formatTerraformErrorOutput(string(ee.Stderr))
+	errOutput := string(ee.Stderr)
+	summary, base64FullErr, err := formatTerraformErrorOutput(errOutput)
 	if err != nil {
 		return err
 	}
 
 	formatString := "Terraform encountered an error. Summary: %s. To see the full error run: echo \"%s\" | base64 -d | gunzip"
+	summaryErr := fmt.Sprintf(formatString, summary, base64FullErr)
 
-	return errors.New(fmt.Sprintf(formatString, summary, base64FullErr))
+	if !tfLockError.MatchString(string(ee.Stderr)) {
+		return formatLockError(errOutput, summaryErr)
+	}
+
+	return errors.New(summaryErr)
+}
+
+func formatLockError(errorOutput, summary string) error {
+	results := tfLockID.FindStringSubmatch(errorOutput)
+	if len(results) != 2 {
+		return errors.New(summary)
+	}
+
+	id := results[1]
+
+	return &LockError{lockID: id, message: summary}
 }
 
 // Format Terraform error output as gzipped and base64 encoded string
