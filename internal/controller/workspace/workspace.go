@@ -30,6 +30,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	extensionsV1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -144,6 +145,7 @@ func Setup(mgr ctrl.Manager, o controller.Options, timeout, pollJitter time.Dura
 		managed.WithPollInterval(o.PollInterval),
 		managed.WithPollJitterHook(pollJitter),
 		managed.WithExternalConnecter(c),
+		managed.WithCriticalAnnotationUpdater(managed.NewRetryingCriticalAnnotationUpdater(mgr.GetClient())),
 		managed.WithLogger(o.Logger.WithValues("controller", name)),
 		managed.WithRecorder(event.NewAPIRecorder(mgr.GetEventRecorderFor(name))),
 		managed.WithTimeout(timeout),
@@ -201,7 +203,6 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 	if !ok {
 		return nil, errors.New(errNotWorkspace)
 	}
-	l := c.logger.WithValues("request", cr.Name)
 	// NOTE(negz): This directory will be garbage collected by the workdir
 	// garbage collector that is started in Setup.
 	dir := filepath.Join(tfDir, string(cr.GetUID()))
@@ -301,25 +302,28 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 		pc.Spec.PluginCache = new(bool)
 		*pc.Spec.PluginCache = true
 	}
+
 	tf := c.terraform(dir)
-	if cr.Status.AtProvider.Checksum != "" {
-		checksum, err := tf.GenerateChecksum(ctx)
-		if err != nil {
-			return nil, errors.Wrap(err, errChecksum)
-		}
-		if cr.Status.AtProvider.Checksum == checksum {
-			l.Debug("Checksums match - skip running terraform init")
-			return &external{tf: tf, kube: c.kube, logger: c.logger}, errors.Wrap(tf.Workspace(ctx, meta.GetExternalName(cr)), errWorkspace)
-		}
-		l.Debug("Checksums don't match so run terraform init:", "old", cr.Status.AtProvider.Checksum, "new", checksum)
+	conn := &external{tf: tf, kube: c.kube, logger: c.logger}
+	runInit, err := checkChecksum(ctx, c.logger, tf, cr)
+	if err != nil {
+		return conn, err
 	}
 
 	o := make([]terraform.InitOption, 0, len(cr.Spec.ForProvider.InitArgs))
 	o = append(o, terraform.WithInitArgs(cr.Spec.ForProvider.InitArgs))
-	if err := tf.Init(ctx, *pc.Spec.PluginCache, o...); err != nil {
-		return nil, errors.Wrap(err, errInit)
+	if runInit {
+		if err := tf.Init(ctx, *pc.Spec.PluginCache, o...); err != nil {
+			return nil, errors.Wrap(err, errInit)
+		}
 	}
-	return &external{tf: tf, kube: c.kube, logger: c.logger}, errors.Wrap(tf.Workspace(ctx, meta.GetExternalName(cr)), errWorkspace)
+	if err := errors.Wrap(tf.Workspace(ctx, meta.GetExternalName(cr)), errWorkspace); err != nil {
+		return conn, err
+	}
+	if err := errors.Wrap(unlockWorkspace(ctx, c.kube, tf, cr), errForceUnlock); err != nil {
+		return conn, err
+	}
+	return conn, nil
 }
 
 type external struct {
@@ -408,22 +412,6 @@ func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.Ext
 		return managed.ExternalUpdate{}, errors.New(errNotWorkspace)
 	}
 
-	l := c.logger.WithValues("request", cr.Name)
-
-	if cr.Annotations == nil {
-		cr.Annotations = map[string]string{}
-	}
-
-	if lockID, ok := cr.Annotations[annotationRemoveLock]; ok {
-		delete(cr.Annotations, annotationRemoveLock)
-		delete(cr.Annotations, annotationHasLock)
-		err := c.tf.ForceUnlock(ctx, lockID)
-		if err != nil {
-			l.Info("failed to force unlock", "lockID", lockID, "err", err.Error())
-			return managed.ExternalUpdate{}, errors.Wrap(err, errForceUnlock)
-		}
-	}
-
 	o, err := c.options(ctx, cr.Spec.ForProvider)
 	if err != nil {
 		return managed.ExternalUpdate{}, errors.Wrap(err, errOptions)
@@ -432,11 +420,15 @@ func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.Ext
 	o = append(o, terraform.WithArgs(cr.Spec.ForProvider.ApplyArgs))
 	if err := c.tf.Apply(ctx, o...); err != nil {
 		lockError := &terraform.LockError{}
-		if !errors.As(err, lockError) {
+		if !errors.As(err, &lockError) {
 			return managed.ExternalUpdate{}, errors.Wrap(err, errApply)
 		}
 
+		if cr.Annotations == nil {
+			cr.Annotations = map[string]string{}
+		}
 		cr.Annotations[annotationHasLock] = lockError.ID()
+		retry.RetryOnConflict(retry.DefaultBackoff, func() error { return c.kube.Update(ctx, cr) })
 		return managed.ExternalUpdate{}, errors.Wrap(err, errApply)
 	}
 
@@ -467,7 +459,23 @@ func (c *external) Delete(ctx context.Context, mg resource.Managed) error {
 	}
 
 	o = append(o, terraform.WithArgs(cr.Spec.ForProvider.DestroyArgs))
-	return errors.Wrap(c.tf.Destroy(ctx, o...), errDestroy)
+
+	if err := c.tf.Destroy(ctx, o...); err != nil {
+		lockError := &terraform.LockError{}
+		if !errors.As(err, &lockError) {
+			return errors.Wrap(err, errDestroy)
+		}
+
+		if cr.Annotations == nil {
+			cr.Annotations = map[string]string{}
+		}
+
+		cr.Annotations[annotationHasLock] = lockError.ID()
+		retry.RetryOnConflict(retry.DefaultBackoff, func() error { return c.kube.Update(ctx, cr) })
+		return errors.Wrap(err, errDestroy)
+	}
+
+	return nil
 }
 
 //nolint:gocyclo
@@ -516,6 +524,29 @@ func (c *external) options(ctx context.Context, p v1beta1.WorkspaceParameters) (
 	return o, nil
 }
 
+func unlockWorkspace(ctx context.Context, kube client.Client, tf tfclient, mg resource.Managed) error {
+	cr, ok := mg.(*v1beta1.Workspace)
+	if !ok {
+		return errors.New(errNotWorkspace)
+	}
+
+	if cr.Annotations == nil {
+		cr.Annotations = map[string]string{}
+	}
+
+	if lockID, ok := cr.Annotations[annotationRemoveLock]; ok {
+		delete(cr.Annotations, annotationRemoveLock)
+		delete(cr.Annotations, annotationHasLock)
+		err := tf.ForceUnlock(ctx, lockID)
+		retry.RetryOnConflict(retry.DefaultBackoff, func() error { return kube.Update(ctx, cr) })
+		if err != nil {
+			return errors.Wrap(err, errForceUnlock)
+		}
+	}
+
+	return nil
+}
+
 func op2cd(o []terraform.Output) managed.ConnectionDetails {
 	cd := managed.ConnectionDetails{}
 	for _, op := range o {
@@ -544,4 +575,21 @@ func generateWorkspaceObservation(op []terraform.Output) v1beta1.WorkspaceObserv
 		}
 	}
 	return wo
+}
+
+func checkChecksum(ctx context.Context, l logging.Logger, tf tfclient, cr *v1beta1.Workspace) (bool, error) {
+	if cr.Status.AtProvider.Checksum != "" {
+		checksum, err := tf.GenerateChecksum(ctx)
+		if err != nil {
+			return true, errors.Wrap(err, errChecksum)
+		}
+		if cr.Status.AtProvider.Checksum == checksum {
+			l.Debug("Checksums match - skip running terraform init")
+			return false, nil
+		}
+		l.Debug("Checksums don't match so run terraform init:", "old", cr.Status.AtProvider.Checksum, "new", checksum)
+		return true, nil
+	}
+
+	return true, nil
 }
